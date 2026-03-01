@@ -1,0 +1,7 @@
+versions/*
+*.log
+*.txt
+extracted_logosv/*
+__pycache__/*
+.venv
+.env
