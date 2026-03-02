@@ -7,8 +7,8 @@ after deduplication), this pipeline extracts the primary logo from each website
 and clusters them by visual similarity - producing groups of domains that share
 the same brand identity, using perceptual hashing and Union-Find.
 
-**Final results**: 3,335 logos extracted (97.6% success rate), organized into
-**1,175 similarity groups** (350 multi-domain clusters + 825 singletons).
+**Final results**: 3,351 logos extracted (98.1% success rate), organized into
+**1,161 similarity groups** (359 multi-domain clusters + 802 singletons).
 
 ---
 
@@ -85,19 +85,22 @@ find a valid candidate doesn't stop the search - all strategies run, and the
 
 | # | Strategy | What it does | Logos found |
 |---|----------|-------------|-------------|
-| 1 | `<img>` tag analysis | Scans `<img>` tags in header/nav, scores by position, alt text, parent classes, URL keywords | 2,136 |
-| 2 | `<link>` tag parsing | `<link rel="icon/apple-touch-icon/shortcut icon">` with size preference | 392 |
-| 3 | Google Favicon API | `google.com/s2/favicons?domain=...&sz=128` - reliable last-resort | 264 |
-| 4 | Inline SVG extraction | `<svg>` elements in header/nav with logo ancestors, serialized as data URIs | 192 |
-| 5 | JSON-LD / Schema.org | Parses `<script type="application/ld+json">` for `logo` or `image` fields | 164 |
-| 6 | Direct favicon | `/favicon.ico`, `/favicon.png`, `/apple-touch-icon.png` URLs | 75 |
-| 7 | `<meta>` tags | `og:image`, `twitter:image`, `msapplication-TileImage` | 72 |
-| 8 | Manifest.json | PWA manifests with icon definitions | 14 |
-| 9 | Google Favicon (fallback) | Used when all HTML strategies fail and page couldn't be fetched | 14 |
-| 10 | CSS `background-image` | Logo classes with `background-image: url(...)` | 4 |
-| 11 | WordPress REST API | `/wp-json/wp/v2/` for `site_logo` / `site_icon` (bypasses WAFs) | 4 |
-| 12 | DuckDuckGo icon API | `icons.duckduckgo.com/ip3/{domain}.ico` | 4 |
-|    | _No logo found_ | Domain unreachable, no valid candidates, WAF-blocked | 81 |
+| 1 | `<img>` tag analysis | Scans `<img>` tags in header/nav, scores by position, alt text, parent classes, URL keywords | 2,234 |
+| 2 | `<link>` tag parsing | `<link rel="icon/apple-touch-icon/shortcut icon">` with size preference | 291 |
+| 3 | Google Favicon API | `google.com/s2/favicons?domain=...&sz=128` - reliable last-resort | 209 |
+| 4 | Playwright `<img>` | JS-rendered pages: same scoring heuristics evaluated in-browser | 192 |
+| 5 | Inline SVG extraction | `<svg>` elements in header/nav with logo ancestors, serialized as data URIs | 166 |
+| 6 | JSON-LD / Schema.org | Parses `<script type="application/ld+json">` for `logo` or `image` fields | 73 |
+| 7 | Playwright inline SVG | Browser-rendered SVGs serialized with sanitization | 67 |
+| 8 | Direct favicon | `/favicon.ico`, `/favicon.png`, `/apple-touch-icon.png` URLs | 47 |
+| 9 | `<meta>` tags | `og:image`, `twitter:image`, `msapplication-TileImage` | 30 |
+| 10 | Google Favicon (fallback) | Used when all HTML strategies fail and page couldn't be fetched | 14 |
+| 11 | Playwright CSS background | Browser-evaluated `background-image: url(...)` on logo elements | 13 |
+| 12 | CSS `background-image` | Logo classes with `background-image: url(...)` | 5 |
+| 13 | DuckDuckGo icon API | `icons.duckduckgo.com/ip3/{domain}.ico` | 5 |
+| 14 | WordPress REST API | `/wp-json/wp/v2/` for `site_logo` / `site_icon` (bypasses WAFs) | 3 |
+| 15 | Playwright JSON-LD | JSON-LD parsed from JS-rendered pages | 2 |
+|    | _No logo found_ | Domain unreachable, no valid candidates, WAF-blocked | 65 |
 
 ### Candidate Scoring System
 
@@ -118,6 +121,8 @@ The highest score wins for each domain. Key scoring factors:
 - Dealer/franchise keywords (autohaus, händler, filiale): **−20**
 - Partner/sponsor/certification keywords: **−25**
 - Social media icons (facebook, twitter): **−40**
+- Social media platform logos (instagram, youtube, linkedin, tiktok): **−60**
+- Footer URL filename ("footer" in path): **−25**
 - No logo/brand signal at all: **−40**
 - Content directories (`/media/`, `/uploads/`): **−25**
 - Third-party brand in alt text (domain-aware check): **−80**
@@ -269,48 +274,48 @@ Deduplication is done via Python `set()` on the domain column before processing.
 | Metric | Value |
 |--------|-------|
 | Unique domains processed | 3,416 |
-| Logos found (URL extracted) | 3,335 (97.6%) |
-| Files successfully downloaded | 3,303 (96.7%) |
-| No logo / errors | 81 |
+| Logos found (URL extracted) | 3,351 (98.1%) |
+| Files successfully downloaded | 3,318 (97.1%) |
+| No logo / errors | 65 |
 
-**File types on disk**: 1,652 PNG, 1,285 SVG, 187 JPG, 93 ICO, 85 WebP, 1 GIF
+**File types on disk**: 1,628 PNG, 1,341 SVG, 177 JPG, 96 WebP, 76 ICO
 
 ### Clustering
 
 | Metric | Value |
 |--------|-------|
-| Total similarity groups | 1,175 |
-| Multi-domain clusters | 350 |
-| Singleton groups | 825 |
-| Avg. multi-domain cluster size | 7.1 |
-| Largest cluster | 221 (AAMCO) |
+| Total similarity groups | 1,161 |
+| Multi-domain clusters | 359 |
+| Singleton groups | 802 |
+| Avg. multi-domain cluster size | 7.0 |
+| Largest cluster | 230 (AAMCO) |
 
 **Group size distribution:**
 
 | Size | Count |
 |------|-------|
-| 1 (singleton) | 825 |
-| 2–5 | 213 |
-| 6–10 | 99 |
-| 11–25 | 24 |
-| 26–50 | 10 |
-| 51–100 | 2 |
-| 100+ | 2 |
+| 1 (singleton) | 802 |
+| 2–5 | 214 |
+| 6–10 | 110 |
+| 11–25 | 22 |
+| 26–50 | 8 |
+| 51–100 | 4 |
+| 100+ | 1 |
 
 ### Top 10 Largest Clusters
 
 | # | Size | Brand | Example domains |
 |---|------|-------|-----------------|
-| 1 | 221 | AAMCO | aamco-bellevue.com, aamco-chesapeakeva.com, ... |
-| 2 | 101 | Mazda | mazda-autohaus-abs-erlangen.de, mazda-autohaus-albers-doerpen.de, ... |
-| 3 | 52 | Kia | kia-ahs-roehrnbach.de, kia-auto-center-weiterstadt.de, ... |
-| 4 | 52 | Spitex | spitex-appenzellerland.ch, spitex-bodensee.ch, ... |
-| 5 | 45 | Culligan | culliganallegan.com, culliganatlanta.com, ... |
-| 6 | 40 | Toyota | toyota-bauer.at, toyota-handler.at, ... |
-| 7 | 33 | Culligan (variant) | allthingswater.com, culliganadvantage.com, ... |
-| 8 | 32 | Nestlé | nestle-caribbean.com, nestle.at, nestle.bg, ... |
-| 9 | 32 | Veolia | veolia.am, veolia.be, veolia.bg, ... |
-| 10 | 30 | B. Braun | bbraun.bg, bbraun.ca, bbraun.cl, ... |
+| 1 | 230 | AAMCO | aamco-bellevue.com, aamco-chesapeakeva.com, ... |
+| 2 | 70 | Mazda | mazda-autohaus-abs-erlangen.de, mazda-autohaus-albers-doerpen.de, ... |
+| 3 | 69 | Culligan | allthingswater.com, culliganadvantage.com, ... |
+| 4 | 53 | Spitex | spitex-aarenord.ch, spitex-appenzellerland.ch, ... |
+| 5 | 52 | Kia | kia-ahs-roehrnbach.de, kia-auto-center-weiterstadt.de, ... |
+| 6 | 37 | Toyota | toyota.com.mt, toyotaakkoyunlu.com.tr, ... |
+| 7 | 32 | Nestlé | nestle-caribbean.com, nestle-esar.com, ... |
+| 8 | 31 | B. Braun | bbraun.bg, bbraun.ca, bbraun.cl, ... |
+| 9 | 31 | Veolia | veolia.am, veolia.be, veolia.bg, ... |
+| 10 | 29 | Airbnb | airbnb.am, airbnb.ba, airbnb.be, ... |
 
 ---
 
@@ -345,10 +350,10 @@ the top 25 groups while successfully merging regional variants.
 - **Genuinely different brand images** - when the same brand uses completely
   different logos on different sites (e.g., dealer text logo vs. brand emblem),
   no perceptual hash can merge them without also merging unrelated logos.
-  Culligan appears as two clusters (45 + 33) because some sites use a different
-  logo variant.
+  Culligan previously appeared as two clusters but now merges into one (69
+  domains) thanks to improved extraction consistency.
 - **WAF-blocked sites** - some domains return 403 on all requests (HTTP,
-  Playwright, and API fallbacks). These account for most of the 81 failures.
+  Playwright, and API fallbacks). These account for most of the 65 failures.
 - **JavaScript-only sites** - sites that require full JS execution to render
   any content depend on the Playwright fallback, which runs sequentially
   and adds extraction time.
@@ -366,7 +371,7 @@ the top 25 groups while successfully merging regional variants.
 | `requirements.txt` | Python dependencies |
 | `extraction_results.json` | Per-domain extraction results (URL, strategy, path, scores) |
 | `clustering_results.json` | Cluster groups, thresholds, and statistics |
-| `extracted_logos/` | Downloaded logo files (3,303 files) |
+| `extracted_logos/` | Downloaded logo files (3,318 files) |
 | `clusters/` | Logos copied with `{group_id}_{filename}` prefix for inspection |
 
 ---
