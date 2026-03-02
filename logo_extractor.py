@@ -15,14 +15,13 @@ with retry logic, proper timeouts, and graceful error handling.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -42,7 +41,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 CONCURRENCY = 40            # max parallel requests
 TIMEOUT_SECONDS = 15        # per-request timeout
 MAX_RETRIES = 2             # retries on transient failures
-OUTPUT_DIR = Path("extracted_logos")
+OUTPUT_DIR = Path("extracted_logosp")
 RESULTS_FILE = Path("extraction_results.json")
 RESULTS_CSV = Path("extraction_results.csv")
 LOG_FILE = Path("extraction.log")
@@ -96,6 +95,66 @@ class LogoResult:
 # Utility helpers
 # ---------------------------------------------------------------------------
 
+# Class/ID patterns that indicate the main page header (not section/card headers)
+_HEADER_CLASS_TOKENS = frozenset([
+    'header', 'site-header', 'page-header', 'main-header', 'top-header',
+    'global-header', 'fixed-header', 'sticky-header', 'l-header', 'c-header',
+    'site_header', 'page_header', 'main_header', 'top_header', 'global_header',
+    'masthead', 'site-head', 'page-head',
+])
+
+# Class tokens that look like "header" but are NOT the page header
+_NON_HEADER_PREFIXES = frozenset([
+    'section', 'card', 'panel', 'article', 'content', 'widget', 'box',
+    'block', 'modal', 'table', 'list', 'grid', 'accordion', 'tab',
+    'column', 'sidebar', 'form', 'field', 'group', 'item', 'entry',
+    'comment', 'post', 'slide', 'media', 'dropdown', 'popup', 'drawer',
+    'overlay', 'dialog', 'step', 'module', 'hero', 'banner',
+    'ehf',  # Elementor Header Footer plugin body class
+])
+
+
+def _is_site_header(tag_name, acls, aid, arole):
+    """Check if this element is the page header (not section/card headers)."""
+    # Never treat <body> or <html> as the header
+    if tag_name in ('body', 'html', '[document]'):
+        return False
+    if tag_name == 'header' or arole == 'banner':
+        return True
+    # Check class tokens
+    tokens = acls.split()
+    for tok in tokens:
+        if tok in _HEADER_CLASS_TOKENS:
+            return True
+        # Accept tokens ending in '-header' or '_header' if prefix is not blacklisted
+        if tok.endswith('-header') or tok.endswith('_header'):
+            prefix = tok.rsplit('-', 1)[0] if '-' in tok else tok.rsplit('_', 1)[0]
+            if prefix not in _NON_HEADER_PREFIXES:
+                return True
+    # Check ID
+    if aid in ('header', 'site-header', 'page-header', 'main-header',
+               'masthead', 'site_header', 'page_header', 'main_header'):
+        return True
+    return False
+
+
+def _is_site_nav(tag_name, acls, aid, arole):
+    """Check if this element is the page navigation."""
+    if tag_name == 'nav' or arole == 'navigation':
+        return True
+    tokens = acls.split()
+    for tok in tokens:
+        if tok in ('navbar', 'navigation', 'nav-bar', 'main-nav', 'site-nav',
+                   'primary-nav', 'top-nav', 'global-nav', 'main-navigation',
+                   'site-navigation', 'primary-navigation', 'nav-menu',
+                   'main_nav', 'site_nav', 'primary_nav', 'top_nav'):
+            return True
+    if aid in ('nav', 'navbar', 'navigation', 'main-nav', 'site-nav',
+               'main_nav', 'site_nav', 'primary-nav'):
+        return True
+    return False
+
+
 def get_user_agent(domain):
     """Deterministic but varied user-agent per domain."""
     idx = hash(domain) % len(USER_AGENTS)
@@ -142,7 +201,12 @@ def is_valid_image_url(url):
     # reject tracking pixels, spacers, common non-logo patterns
     # Only match on the filename part to avoid false positives from directory names
     reject_filename = ["spacer", "pixel", "tracking", "1x1", "blank.",
-                       "spinner", "loading", "placeholder"]
+                       "spinner", "loading", "placeholder",
+                       "cart", "basket", "search", "hamburger",
+                       "account", "login", "user-icon", "phone",
+                       "envelope", "email-icon", "close", "cross",
+                       "chevron", "arrow", "caret", "toggle",
+                       "wishlist", "heart", "share", "print"]
     if any(r in path_end for r in reject_filename):
         return False
     
@@ -150,8 +214,18 @@ def is_valid_image_url(url):
     reject_full = ["profile-photo", "profile-pic", "profile-image",
                    "avatar/", "avatar.", "user-avatar",
                    "/wallpaper", "bg-pattern", "bg-texture",
-                   "/flags/"]
+                   "/flags/", "/flags.", "flag-icon", "flag_icon",
+                   "/country-flag", "/country_flag", "flagcdn.com",
+                   "flagpedia", "countryflags",
+                   "wp-includes/images/media/default",
+                   "wp-includes/images/w-logo",
+                   "wp-includes/images/blank.gif",
+                   "/g-placeholder"]
     if any(r in lower for r in reject_full):
+        return False
+    
+    # Reject flag images in filename (but not if "logo" is also present)
+    if ("flag" in path_end) and ("logo" not in path_end):
         return False
     
     # reject third-party logos (cookie banners, analytics, captchas, etc.)
@@ -160,7 +234,10 @@ def is_valid_image_url(url):
                           "evidon.com", "quantcast", "termly.io",
                           "powered_by_logo", "gdpr", "consent-manager",
                           "captcha-delivery.com", "/captcha/", "datadome.co",
-                          "hcaptcha.com", "recaptcha"]
+                          "hcaptcha.com", "recaptcha",
+                          "facebook.com/tr", "analytics.", "pixel.",
+                          "beacon.", "gstatic.com/images/branding",
+                          "google.com/images/branding", "translate.google"]
     if any(r in lower for r in third_party_reject):
         return False
     return True
@@ -346,6 +423,17 @@ def score_logo_candidate(url, tag_context):
             score -= 25
             break
 
+    # UI icons (cart, search, account, etc.) in header/nav
+    ui_icon_keywords = ["cart", "basket", "search", "hamburger",
+                        "account", "login", "phone", "envelope",
+                        "wishlist", "heart", "share", "print",
+                        "cross", "toggle", "eicon"]
+    if not has_logo_signal:
+        for kw in ui_icon_keywords:
+            if kw in all_context:
+                score -= 60
+                break
+
     # URL path hints at non-primary logo
     if any(x in url_path for x in ["/logos/", "/partner", "/client",
                                      "/sponsor", "/certification", "/award"]):
@@ -359,10 +447,24 @@ def score_logo_candidate(url, tag_context):
         score -= 10
     if "social" in lower_url or "facebook" in lower_url or "twitter" in lower_url:
         score -= 40
+    # Social media platform logos embedded on the page (not the site's own logo)
+    social_platforms = ["instagram", "youtube", "linkedin", "tiktok",
+                        "pinterest", "telegram", "whatsapp", "snapchat",
+                        "vimeo", "flickr", "tumblr", "reddit",
+                        "amazon-logo", "amazon_logo", "paypal-logo",
+                        "paypal_logo", "google-logo", "google_logo"]
+    for sp in social_platforms:
+        if sp in lower_url:
+            score -= 60
+            break
     if "flag" in lower_url:
-        score -= 20
+        score -= 60
     if "favicon" in lower_url:
         score -= 15
+    # URL filename contains "footer" → likely a footer-specific logo variant
+    url_filename = lower_url.rsplit("/", 1)[-1] if "/" in lower_url else lower_url
+    if "footer" in url_filename:
+        score -= 25
 
     # ---- Homepage-link bonus ----
     # Images inside <a href="/"> are almost always the main site logo
@@ -423,6 +525,61 @@ _WHITE_FILLS = frozenset(["#fff", "#ffffff", "white", "rgb(255,255,255)"])
 
 _MIN_SVG_VIEWBOX = 20  # reject SVGs whose viewBox is smaller than 20x20
 
+# Common lazy-load placeholder src patterns
+_LAZY_PLACEHOLDER_PREFIXES = (
+    'data:image/gif;base64,',
+    'data:image/png;base64,iVBOR',   # tiny 1x1 PNG
+    'data:image/svg+xml,%3Csvg',     # empty SVG placeholder
+    'about:blank',
+)
+
+
+def _get_img_src(img):
+    """Get the real image src, handling lazy-load placeholders.
+
+    Many sites (WordPress, Elementor, etc.) set src to a tiny data URI
+    placeholder and store the real URL in data-src / data-lazy-src.
+    """
+    src = img.get('src', '')
+    # If src is a lazy-load placeholder, prefer data-src / data-lazy-src
+    # But keep large inline SVG data URIs (>200 chars) — they're real logos, not placeholders
+    if src and any(src.startswith(p) for p in _LAZY_PLACEHOLDER_PREFIXES):
+        if not (src.startswith('data:image/svg+xml') and len(src) > 200):
+            real = (img.get('data-src') or img.get('data-lazy-src')
+                    or img.get('data-original') or img.get('data-lazy'))
+            if real:
+                return real
+    # Normal fallback chain
+    if not src:
+        src = (img.get('data-src') or img.get('data-lazy-src')
+               or img.get('data-original') or img.get('data-lazy') or '')
+    return src
+
+
+# Elementor / page-builder widget classes that definitively mark a site logo
+_LOGO_WIDGET_CLASSES = frozenset({
+    'elementor-widget-theme-site-logo',
+    'elementor-widget-site-logo',
+    'wp-block-site-logo',
+    'custom-logo-link',
+    'site-logo',
+    'site-branding',
+})
+
+
+def _has_logo_widget_ancestor(tag):
+    """Return True if any ancestor has a known CMS/page-builder logo-widget class."""
+    for anc in tag.parents:
+        if not hasattr(anc, 'get'):
+            continue
+        cls_list = anc.get('class', [])
+        if not cls_list:
+            continue
+        cls_lower = {c.lower() for c in cls_list}
+        if cls_lower & _LOGO_WIDGET_CLASSES:
+            return True
+    return False
+
 
 def _svg_too_small(svg_text):
     """Return True if the SVG viewBox/width/height is tiny (icon, not logo)."""
@@ -462,9 +619,13 @@ def _sanitize_svg(data):
     # Add xmlns if missing
     if "xmlns" not in text and "<svg" in text:
         text = text.replace("<svg ", '<svg xmlns="http://www.w3.org/2000/svg" ', 1)
-    # currentcolor -> black
-    text = re.sub(r"""fill\s*=\s*['"]currentcolor['"]""", 'fill="#000000"', text, flags=re.I)
-    text = re.sub(r'fill\s*:\s*currentcolor', 'fill:#000000', text, flags=re.I)
+    # currentcolor in standalone SVG defaults to black in most viewers,
+    # so we leave fill currentColor as-is when the SVG already has explicit colors.
+    # This preserves blue/red/etc logos that use a mix of currentColor and explicit fills.
+    has_explicit_fills = bool(re.search(r"""fill\s*=\s*['"](?!currentcolor|currentColor|none)[^'"]+['"]""", text))
+    if not has_explicit_fills:
+        text = re.sub(r"""fill\s*=\s*['"]currentcolor['"]""", 'fill="#000000"', text, flags=re.I)
+        text = re.sub(r'fill\s*:\s*currentcolor', 'fill:#000000', text, flags=re.I)
     text = re.sub(r"""stroke\s*=\s*['"]currentcolor['"]""", 'stroke="#000000"', text, flags=re.I)
     text = re.sub(r'stroke\s*:\s*currentcolor', 'stroke:#000000', text, flags=re.I)
     # Remove display:none / display:block that hides content
@@ -511,7 +672,7 @@ def extract_from_link_tags(soup, base_url):
 
         # apple-touch-icon is usually high-quality
         if "apple-touch-icon" in rel_str:
-            candidates.append((url, 50))
+            candidates.append((url, 60))
         elif "icon" in rel_str and url.lower().endswith(".svg"):
             # SVG favicons are high-quality vector logos
             candidates.append((url, 65))
@@ -559,7 +720,18 @@ def extract_from_meta_tags(soup, base_url):
                 if url and is_valid_image_url(url):
                     # Boost if URL contains "logo"
                     bonus = 20 if is_likely_logo_url(url) else 0
-                    candidates.append((url, score + bonus))
+                    s = score + bonus
+                    # Penalize third-party brand logos in URL
+                    lower_url = url.lower()
+                    _tp_brands = ["instagram", "youtube", "linkedin", "tiktok",
+                                  "pinterest", "telegram", "whatsapp", "snapchat",
+                                  "vimeo", "flickr", "tumblr", "reddit",
+                                  "amazon-logo", "amazon_logo", "paypal-logo",
+                                  "paypal_logo", "google-logo", "google_logo",
+                                  "facebook", "twitter", "social"]
+                    if any(b in lower_url for b in _tp_brands):
+                        s -= 60
+                    candidates.append((url, s))
 
     return candidates
 
@@ -577,7 +749,7 @@ def extract_from_img_tags(soup, base_url, domain=""):
     nav_el = soup.find("nav")
 
     for idx, img in enumerate(soup.find_all("img")):
-        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+        src = _get_img_src(img)
         # Fallback to srcset if no src - take the first URL from srcset
         if not src:
             srcset = img.get("srcset", "")
@@ -597,36 +769,32 @@ def extract_from_img_tags(soup, base_url, domain=""):
         grandparent = parent.parent if parent else None
 
         # Check if img is inside <header>, <footer>, <nav>
+        # Also detect class-based header/nav (e.g. <div class="header">)
         is_in_header = False
         is_in_footer = False
         is_in_nav = False
+        is_logo_widget = _has_logo_widget_ancestor(img)
         for ancestor in img.parents:
             tag_name = getattr(ancestor, "name", "")
             acls = ' '.join(ancestor.get('class', [])).lower() if hasattr(ancestor, 'get') else ''
+            aid = (ancestor.get('id', '') or '').lower() if hasattr(ancestor, 'get') else ''
             arole = (ancestor.get('role', '') or '').lower() if hasattr(ancestor, 'get') else ''
-            if tag_name == "header" or arole == 'banner':
+            if _is_site_header(tag_name, acls, aid, arole):
                 is_in_header = True
-            if tag_name == "footer":
+            if tag_name == "footer" or 'footer' in acls:
                 is_in_footer = True
-            if tag_name == "nav" or arole == 'navigation' or 'navigation' in acls or 'navbar' in acls:
+            if _is_site_nav(tag_name, acls, aid, arole):
                 is_in_nav = True
 
         # ---- SKIP images outside header/nav ----
         # Logo-ul principal e mereu în header sau nav, nu în body.
-        # Fallback: acceptăm primele 5 img din DOM dacă au "logo" explicit
-        if not is_in_header and not is_in_nav:
-            # Allow early-DOM images that have explicit logo signal in URL/class/alt/id
-            _img_cls = ' '.join(img.get('class', [])).lower()
-            _img_id = (img.get('id', '') or '').lower()
-            _img_alt = (img.get('alt', '') or '').lower()
-            _p_cls = ' '.join(parent.get('class', [])).lower() if parent and hasattr(parent, 'get') else ''
-            _p_id = (parent.get('id', '') or '').lower() if parent and hasattr(parent, 'get') else ''
-            has_explicit_logo = ('logo' in url.lower() or 'logo' in _img_cls or
-                                 'logo' in _img_id or 'logo' in _img_alt or
-                                 'logo' in _p_cls or 'logo' in _p_id or
-                                 'brand' in _img_cls or 'brand' in _p_cls)
-            if not (idx < 5 and has_explicit_logo):
-                continue  # skip body images
+        # Exception: CMS logo widgets (Elementor theme-site-logo, WP site-logo)
+        if not is_in_header and not is_in_nav and not is_logo_widget:
+            continue  # skip all images outside header/nav
+
+        # Treat logo-widget images as being in header for scoring
+        if is_logo_widget and not is_in_header:
+            is_in_header = True
 
         # Check if img is inside an <a> linking to the homepage
         parent_a = img.find_parent("a")
@@ -670,15 +838,34 @@ def extract_from_svg_inline(soup, base_url):
     candidates = []
 
     def _fix_currentcolor(svg_str):
-        """Replace fill/stroke='currentcolor' with black so SVG renders standalone."""
-        svg_str = re.sub(r'fill\s*=\s*["\']currentcolor["\']', 'fill="#000000"', svg_str, flags=re.I)
-        svg_str = re.sub(r'fill\s*:\s*currentcolor', 'fill:#000000', svg_str, flags=re.I)
+        """Replace fill/stroke='currentcolor' with black so SVG renders standalone.
+        Only replace fill if there are no explicit fill colors already set."""
+        has_explicit = bool(re.search(r'fill\s*=\s*["\'](?!currentcolor|none)[^"\']+["\']', svg_str, re.I))
+        if not has_explicit:
+            svg_str = re.sub(r'fill\s*=\s*["\']currentcolor["\']', 'fill="#000000"', svg_str, flags=re.I)
+            svg_str = re.sub(r'fill\s*:\s*currentcolor', 'fill:#000000', svg_str, flags=re.I)
         svg_str = re.sub(r'stroke\s*=\s*["\']currentcolor["\']', 'stroke="#000000"', svg_str, flags=re.I)
         svg_str = re.sub(r'stroke\s*:\s*currentcolor', 'stroke:#000000', svg_str, flags=re.I)
         return svg_str
 
     # Approach 1: SVG inside <a> tags linking to homepage with <img> fallback
+    # Only consider <a> tags inside header/nav
     for a_tag in soup.find_all("a", href=True):
+        # Check if <a> is inside header or nav (including class-based detection)
+        a_in_header = False
+        a_in_nav = False
+        for anc in a_tag.parents:
+            tag_name = getattr(anc, 'name', '')
+            acls = ' '.join(anc.get('class', [])).lower() if hasattr(anc, 'get') else ''
+            aid = (anc.get('id', '') or '').lower() if hasattr(anc, 'get') else ''
+            arole = (anc.get('role', '') or '').lower() if hasattr(anc, 'get') else ''
+            if _is_site_header(tag_name, acls, aid, arole):
+                a_in_header = True
+            if _is_site_nav(tag_name, acls, aid, arole):
+                a_in_nav = True
+        if not a_in_header and not a_in_nav:
+            continue  # skip SVG links outside header/nav
+
         href = a_tag.get("href", "").strip()
         # Only consider links to homepage-like paths
         is_homepage_link = href in ("/", "#", "", "./")
@@ -700,13 +887,33 @@ def extract_from_svg_inline(soup, base_url):
         # Check for nearby <img> fallback
         img = a_tag.find("img")
         if img:
-            src = img.get("src") or img.get("data-src")
+            src = _get_img_src(img)
             if src:
                 url = normalize_url(src, base_url)
                 if url and is_valid_image_url(url):
                     candidates.append((url, 75))  # high confidence
         else:
             # No <img> fallback - serialize the inline SVG as data URI
+            # Skip SVGs that are clearly UI icons (same filter as approach 2)
+            svg_cls = ' '.join(svg.get('class', [])).lower()
+            aria_hidden = svg.get('aria-hidden', '').lower()
+            if aria_hidden == 'true':
+                continue
+            icon_cls_hints = ['icon', 'toggle', 'menu', 'chevron', 'arrow',
+                              'spinner', 'loading', 'caret', 'close',
+                              'cart', 'basket', 'search', 'hamburger',
+                              'account', 'user', 'login', 'phone',
+                              'envelope', 'email', 'wishlist', 'heart',
+                              'share', 'print', 'cross', 'plus', 'minus',
+                              'eicon', 'fa-', 'fas ', 'far ', 'fab ']
+            if any(h in svg_cls for h in icon_cls_hints):
+                continue
+            # Also check <a> tag class/id for icon/UI hints
+            a_cls_full = ' '.join(a_tag.get('class', [])).lower()
+            a_id_full = (a_tag.get('id', '') or '').lower()
+            a_context = f"{a_cls_full} {a_id_full}"
+            if any(h in a_context for h in icon_cls_hints) and 'logo' not in a_context:
+                continue
             svg_str = _fix_currentcolor(str(svg))
             if len(svg_str) > 200 and not _svg_too_small(svg_str):
                 encoded = base64.b64encode(svg_str.encode('utf-8')).decode('ascii')
@@ -730,7 +937,12 @@ def extract_from_svg_inline(soup, base_url):
         if aria_hidden == 'true':
             continue  # decorative/UI icon
         icon_cls_hints = ['icon', 'toggle', 'menu', 'chevron', 'arrow',
-                          'spinner', 'loading', 'caret', 'close']
+                          'spinner', 'loading', 'caret', 'close',
+                          'cart', 'basket', 'search', 'hamburger',
+                          'account', 'user', 'login', 'phone',
+                          'envelope', 'email', 'wishlist', 'heart',
+                          'share', 'print', 'cross', 'plus', 'minus',
+                          'eicon', 'fa-', 'fas ', 'far ', 'fab ']
         if any(h in svg_cls for h in icon_cls_hints):
             continue
 
@@ -833,11 +1045,27 @@ def extract_from_json_ld(soup, base_url):
 def extract_from_css_background(soup, base_url):
     """
     Strategy 6: Elements with inline style background-image that contain 'logo'.
+    Only considers elements inside header/nav.
     """
     candidates = []
     bg_re = re.compile(r"url\(['\"]?([^)'\"]+(logo|brand)[^)'\"]*)[\'\"]?\)", re.I)
 
     for tag in soup.find_all(style=True):
+        # Only consider elements inside header/nav (including class-based)
+        in_header = False
+        in_nav = False
+        for anc in tag.parents:
+            tag_name = getattr(anc, 'name', '')
+            acls = ' '.join(anc.get('class', [])).lower() if hasattr(anc, 'get') else ''
+            aid = (anc.get('id', '') or '').lower() if hasattr(anc, 'get') else ''
+            arole = (anc.get('role', '') or '').lower() if hasattr(anc, 'get') else ''
+            if _is_site_header(tag_name, acls, aid, arole):
+                in_header = True
+            if _is_site_nav(tag_name, acls, aid, arole):
+                in_nav = True
+        if not in_header and not in_nav:
+            continue
+
         style = tag.get("style", "")
         match = bg_re.search(style)
         if match:
@@ -1095,12 +1323,17 @@ async def download_google_favicon_fallback(session,domain, output_dir):
 async def download_logo(session,logo_url, domain, output_dir):
     """Download the logo and save to disk. Returns the saved file path."""
 
-    # Handle inline SVG data URIs (from extract_from_svg_inline)
-    if logo_url.startswith("data:image/svg+xml;base64,"):
+    # Handle inline SVG data URIs (from extract_from_svg_inline or img src)
+    if logo_url.startswith("data:image/svg+xml"):
+        from urllib.parse import unquote
         import base64 as b64
         try:
-            encoded = logo_url.split(",", 1)[1]
-            svg_data = b64.b64decode(encoded)
+            payload = logo_url.split(",", 1)[1]
+            if ";base64," in logo_url:
+                svg_data = b64.b64decode(payload)
+            else:
+                # URL-encoded SVG (e.g. data:image/svg+xml,%3csvg...)
+                svg_data = unquote(payload).encode('utf-8')
             if len(svg_data) < 400:
                 return None  # too small, probably not a real logo
             svg_text = svg_data.decode('utf-8', errors='replace')
@@ -1142,6 +1375,18 @@ async def download_logo(session,logo_url, domain, output_dir):
                 # Reject tiny SVG icons (close buttons, arrows, etc.)
                 elif (ext == ".svg" or "svg" in ct) and _svg_too_small(data.decode('utf-8', errors='replace')):
                     valid = False
+
+                # Reject banner-sized raster images (logos are rarely > 800x400)
+                if valid and "svg" not in ct and ext != ".svg":
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(io.BytesIO(data))
+                        w, h = img.size
+                        if w > 800 and h > 400:
+                            valid = False  # banner/hero image, not a logo
+                    except Exception:
+                        pass
 
                 if valid:
                     # Sanitize SVG content
@@ -1256,6 +1501,13 @@ async def extract_logo_for_domain(session,domain,output_dir,semaphore):
                                 html = await resp.text(errors="replace")
                                 base_url = str(resp.url)  # follow redirects
                                 break
+                            # Accept 403/404/etc. pages that may still have HTML with logos
+                            elif resp.status in (403, 404, 406, 451, 503):
+                                maybe_html = await resp.text(errors="replace")
+                                if len(maybe_html) > 2000 and '<' in maybe_html[:200]:
+                                    html = maybe_html
+                                    base_url = str(resp.url)
+                                    break
                     except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError):
                         continue
                     except Exception:
@@ -1370,13 +1622,12 @@ async def extract_logo_for_domain(session,domain,output_dir,semaphore):
 
         # ------- Step 4: Pick best candidate -------
         if all_candidates:
-            # Deduplicate by URL
-            seen = set()
-            unique = []
+            # Deduplicate by URL, keeping the highest score for each URL
+            best_by_url = {}
             for url, score, strategy in all_candidates:
-                if url not in seen:
-                    seen.add(url)
-                    unique.append((url, score, strategy))
+                if url not in best_by_url or score > best_by_url[url][1]:
+                    best_by_url[url] = (url, score, strategy)
+            unique = list(best_by_url.values())
 
             # Sort by score descending
             unique.sort(key=lambda x: x[1], reverse=True)
@@ -1499,42 +1750,35 @@ async def run_extraction(domains,output_dir,concurrency = CONCURRENCY):
 # Playwright dynamic extraction for SPA/JS-rendered sites
 # ---------------------------------------------------------------------------
 
-def _pw_extract_logo_from_page(page, domain):
-    """
-    Use Playwright to render a page and extract the logo.
-    Looks for <img> elements in the top portion of the viewport
-    that have logo-related attributes.
-    Returns dict with logo_url and strategy, or None.
-    """
+
+async def _pw_extract_logo_from_page_async(page, domain):
+    """Async version of _pw_extract_logo_from_page for parallel Playwright."""
     try:
-        # Navigate with a generous timeout
         url = f"https://{domain}"
         try:
-            page.goto(url, wait_until="networkidle", timeout=20000)
+            await page.goto(url, wait_until="networkidle", timeout=20000)
         except Exception:
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             except Exception:
-                # Try with www
                 url = f"https://www.{domain}"
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 except Exception:
                     return None
 
-        # Wait a bit for lazy-loaded content
-        page.wait_for_timeout(2000)
+        await page.wait_for_timeout(4000)
 
-        # Detect captcha/challenge pages in Playwright
-        pw_title = page.title().lower()
+        # Detect captcha/challenge pages
+        pw_title = await page.title()
+        pw_title = pw_title.lower()
         captcha_signals = ["captcha", "security check", "challenge",
                            "just a moment", "attention required",
                            "ddos-guard", "access denied", "bot verification"]
         if any(s in pw_title for s in captcha_signals):
             return None
-        # Also check for captcha-delivery.com in page content
         try:
-            has_captcha = page.evaluate(r"""() => {
+            has_captcha = await page.evaluate(r"""() => {
                 const html = document.documentElement.innerHTML.substring(0, 5000).toLowerCase();
                 return html.includes('captcha-delivery.com') || html.includes('datadome');
             }""")
@@ -1543,8 +1787,8 @@ def _pw_extract_logo_from_page(page, domain):
         except Exception:
             pass
 
-        # Use JavaScript to find logo candidates in the rendered DOM
-        candidates = page.evaluate(r"""() => {
+        # Reuse the same JS evaluation as the sync version
+        candidates = await page.evaluate(r"""() => {
             const results = [];
             
             function getClassName(el) {
@@ -1554,27 +1798,92 @@ def _pw_extract_logo_from_page(page, domain):
                 return '';
             }
 
-            // Strategy 1: Find img elements with logo in class/id/alt/src
+            const _headerTokens = new Set(['header','site-header','page-header','main-header','top-header',
+                'global-header','fixed-header','sticky-header','l-header','c-header',
+                'site_header','page_header','main_header','top_header','global_header',
+                'masthead','site-head','page-head']);
+            const _nonHeaderPrefixes = new Set(['section','card','panel','article','content','widget','box',
+                'block','modal','table','list','grid','accordion','tab','column','sidebar','form',
+                'field','group','item','entry','comment','post','slide','media','dropdown','popup',
+                'drawer','overlay','dialog','step','module','hero','banner','ehf']);
+            const _headerIds = new Set(['header','site-header','page-header','main-header','masthead',
+                'site_header','page_header','main_header']);
+
+            function isSiteHeader(el) {
+                const tn = el.tagName;
+                if (tn === 'BODY' || tn === 'HTML') return false;
+                if (tn === 'HEADER') return true;
+                const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+                if (role === 'banner') return true;
+                const ecls = getClassName(el).toLowerCase();
+                const eid = (el.id || '').toLowerCase();
+                for (const tok of ecls.split(/\s+/)) {
+                    if (_headerTokens.has(tok)) return true;
+                    if (tok.endsWith('-header') || tok.endsWith('_header')) {
+                        const sep = tok.includes('-') ? '-' : '_';
+                        const prefix = tok.substring(0, tok.lastIndexOf(sep));
+                        if (!_nonHeaderPrefixes.has(prefix)) return true;
+                    }
+                }
+                if (_headerIds.has(eid)) return true;
+                return false;
+            }
+
+            const _navTokens = new Set(['navbar','navigation','nav-bar','main-nav','site-nav',
+                'primary-nav','top-nav','global-nav','main-navigation','site-navigation',
+                'primary-navigation','nav-menu','main_nav','site_nav','primary_nav','top_nav']);
+            const _navIds = new Set(['nav','navbar','navigation','main-nav','site-nav',
+                'main_nav','site_nav','primary-nav']);
+
+            function isSiteNav(el) {
+                if (el.tagName === 'NAV') return true;
+                const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
+                if (role === 'navigation') return true;
+                const ecls = getClassName(el).toLowerCase();
+                for (const tok of ecls.split(/\s+/)) {
+                    if (_navTokens.has(tok)) return true;
+                }
+                const eid = (el.id || '').toLowerCase();
+                if (_navIds.has(eid)) return true;
+                return false;
+            }
+
             const imgs = document.querySelectorAll('img');
             imgs.forEach((img, idx) => {
-                let src = img.src || img.dataset?.src || '';
+                let src = img.src || '';
+                // If src is a lazy-load placeholder (data URI), prefer data-src
+                // But keep large inline SVG data URIs (>200 chars) — they're real logos
+                if (src.startsWith('data:')) {
+                    const isRealSvg = src.startsWith('data:image/svg+xml') && src.length > 200;
+                    if (!isRealSvg) {
+                        const real = img.dataset?.src || img.dataset?.lazySrc || img.dataset?.original || img.dataset?.lazy || '';
+                        if (real) src = real;
+                    }
+                }
+                if (!src) src = img.dataset?.src || img.dataset?.lazySrc || img.dataset?.original || '';
                 // Fallback to srcset if no src
                 if ((!src || src.startsWith('data:')) && img.srcset) {
-                    const first = img.srcset.split(',')[0].trim().split(/\\s+/)[0];
+                    const first = img.srcset.split(',')[0].trim().split(/\s+/)[0];
                     if (first) src = first;
                 }
-                if (!src || src.startsWith('data:')) return;
-                
-                // Reject third-party cookie/consent/widget logos
+                // Skip data URIs unless they're real inline SVGs
+                if (!src) return;
+                if (src.startsWith('data:') && !(src.startsWith('data:image/svg+xml') && src.length > 200)) return;
                 const rejectDomains = ['cookielaw.org', 'cookiebot.com', 'onetrust.com',
                     'cookie-cdn', 'cookie-script', 'trustarc', 'evidon.com',
                     'quantcast', 'termly.io', 'powered_by_logo', 'gdpr', 'consent-manager',
                     'gstatic.com/images/branding', 'google.com/images/branding',
                     'googlelogo', 'google-logo', 'translate.google', 'recaptcha.net',
                     'facebook.com/tr', 'analytics.', 'pixel.', 'beacon.',
-                    'captcha-delivery.com', '/captcha/', 'datadome.co', 'hcaptcha.com'];
+                    'captcha-delivery.com', '/captcha/', 'datadome.co', 'hcaptcha.com',
+                    '/flags/', '/flags.', 'flag-icon', 'flag_icon', 'flagcdn.com',
+                    'countryflags', 'country-flag', 'country_flag', 'flagpedia',
+                    'wp-includes/images/media/default', 'wp-includes/images/w-logo',
+                    'wp-includes/images/blank.gif', '/g-placeholder'];
                 if (rejectDomains.some(d => src.toLowerCase().includes(d))) return;
-
+                // Reject flag images in filename (unless logo is also in the name)
+                const srcFile = src.split('/').pop().toLowerCase();
+                if (srcFile.includes('flag') && !srcFile.includes('logo')) return;
                 const alt = (img.alt || '').toLowerCase();
                 const cls = getClassName(img).toLowerCase();
                 const id = (img.id || '').toLowerCase();
@@ -1582,27 +1891,30 @@ def _pw_extract_logo_from_page(page, domain):
                 const parentId = (img.parentElement?.id || '').toLowerCase();
                 const gpCls = getClassName(img.parentElement?.parentElement).toLowerCase();
                 const gpId = (img.parentElement?.parentElement?.id || '').toLowerCase();
-
+                // Reject UI icons by class/alt
+                const uiIconHints = ['cart', 'basket', 'search', 'hamburger', 'account',
+                    'user-icon', 'login', 'phone', 'envelope', 'email-icon', 'wishlist',
+                    'heart', 'share', 'print', 'close', 'cross', 'toggle',
+                    'eicon', 'fa-', 'fas ', 'far ', 'fab '];
+                const imgCtx = `${cls} ${id} ${parentCls} ${alt}`;
+                if (uiIconHints.some(h => imgCtx.includes(h)) && !imgCtx.includes('logo')) return;
                 const context = `${src} ${alt} ${cls} ${id} ${parentCls} ${parentId} ${gpCls} ${gpId}`.toLowerCase();
-
-                // Check if it's in header/nav
                 let inHeader = false, inNav = false, inFooter = false;
+                let isLogoWidget = false;
+                const _logoWidgetClasses = ['elementor-widget-theme-site-logo',
+                    'elementor-widget-site-logo', 'wp-block-site-logo',
+                    'custom-logo-link', 'site-logo', 'site-branding'];
                 let el = img;
                 while (el) {
-                    const tn = el.tagName;
+                    if (isSiteHeader(el)) inHeader = true;
+                    if (isSiteNav(el)) inNav = true;
                     const ecls = getClassName(el).toLowerCase();
-                    const erole = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
-                    if (tn === 'HEADER' || erole === 'banner') inHeader = true;
-                    if (tn === 'NAV' || erole === 'navigation' || ecls.includes('navigation') || ecls.includes('navbar')) inNav = true;
-                    if (tn === 'FOOTER') inFooter = true;
+                    if (el.tagName === 'FOOTER' || ecls.includes('footer')) inFooter = true;
+                    if (_logoWidgetClasses.some(c => ecls.includes(c))) isLogoWidget = true;
                     el = el.parentElement;
                 }
-
-                // Check position - logos are in the top of the page
                 const rect = img.getBoundingClientRect();
                 const inTopArea = rect.top < 200;
-
-                // Calculate score
                 let score = 0;
                 if (context.includes('logo')) score += 50;
                 if (context.includes('brand')) score += 30;
@@ -1616,8 +1928,6 @@ def _pw_extract_logo_from_page(page, domain):
                 if (inNav) score += 20;
                 if (inTopArea) score += 25;
                 if (inFooter) score -= 30;
-                
-                // Homepage-link bonus: img inside <a href="/">
                 const imgLink = img.closest('a');
                 if (imgLink) {
                     const lhref = (imgLink.getAttribute('href') || '').trim();
@@ -1625,69 +1935,56 @@ def _pw_extract_logo_from_page(page, domain):
                         lhref === location.origin || lhref === location.origin + '/';
                     if (isHome) score += 40;
                 }
-                
                 if (context.includes('dealer')) score -= 20;
                 if (context.includes('partner') || context.includes('sponsor')) score -= 25;
+                if (context.includes('flag')) score -= 60;
                 if (src.endsWith('.svg')) score += 15;
                 if (idx < 5) score += 10;
-
-                // Visibility check
                 const style = window.getComputedStyle(img);
                 const visible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
                 if (!visible) score -= 50;
-
-                // ANY img in top area with non-trivial size gets a baseline
-                if (inTopArea && visible && img.naturalWidth > 30 && img.naturalHeight > 10) {
-                    score += 5;
-                }
-
-                // Penalize very large images (carousel/hero) with no logo signal
-                if (img.naturalWidth > 600 && img.naturalHeight > 300 && score < 50) {
-                    score -= 30;
-                }
-
-                // Reject third-party (off-domain) images with no logo signal
+                if (inTopArea && visible && img.naturalWidth > 30 && img.naturalHeight > 10) score += 5;
+                if (img.naturalWidth > 600 && img.naturalHeight > 300 && score < 50) score -= 30;
                 try {
                     const imgHost = new URL(src).hostname;
                     const pageDomain = location.hostname.replace('www.', '');
                     if (!imgHost.includes(pageDomain) && !pageDomain.includes(imgHost.replace('www.',''))) {
-                        if (score < 50) return; // off-domain + no logo signal = skip
+                        if (score < 50) return;
                     }
                 } catch(e) {}
-
-                if (score > 10) {
-                    results.push({url: src, score: score, strategy: 'playwright_img'});
-                }
+                // Only keep images from header/nav or logo widgets
+                if (!inHeader && !inNav && !isLogoWidget) return;
+                if (isLogoWidget && !inHeader) { inHeader = true; score += 30; }
+                if (score > 10) results.push({url: src, score: score, strategy: 'playwright_img'});
             });
 
-            // Strategy 2: SVG elements that look like logos
             document.querySelectorAll('svg').forEach(svg => {
-                // Skip tiny SVGs (UI icons like chevrons, arrows)
                 const svgCls = getClassName(svg).toLowerCase();
-                const iconHints = ['icon', 'toggle', 'menu', 'chevron', 'arrow', 'spinner', 'caret', 'close'];
+                const iconHints = ['icon', 'toggle', 'menu', 'chevron', 'arrow', 'spinner', 'caret', 'close',
+                    'cart', 'basket', 'search', 'hamburger', 'account', 'user', 'login', 'phone',
+                    'envelope', 'email', 'wishlist', 'heart', 'share', 'print', 'cross', 'plus', 'minus',
+                    'eicon', 'fa-', 'fas ', 'far ', 'fab '];
                 if (iconHints.some(h => svgCls.includes(h))) return;
+                // Skip aria-hidden SVGs (decorative/UI icons)
                 const ariaHidden = svg.getAttribute('aria-hidden');
-                
+                if (ariaHidden === 'true') return;
                 let el = svg;
                 let inHeader = false, inNav = false;
                 let parentHasLogo = false;
                 while (el) {
                     const cls = getClassName(el).toLowerCase();
                     const id = (el.id || '').toLowerCase();
-                    const role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
-                    if (el.tagName === 'HEADER' || cls.includes('header') || role === 'banner') inHeader = true;
-                    if (el.tagName === 'NAV' || /\bnav[-\s]/.test(cls) || role === 'navigation' || cls.includes('navbar') || cls.includes('navigation')) inNav = true;
+                    if (isSiteHeader(el)) inHeader = true;
+                    if (isSiteNav(el)) inNav = true;
                     if (cls.includes('logo') || id.includes('logo') || cls.includes('brand') || id.includes('brand')) parentHasLogo = true;
                     el = el.parentElement;
                 }
-                
                 function serializeSvg(score, strat) {
                     const link = svg.closest('a');
                     const img = link?.querySelector('img');
                     if (img && img.src) {
                         results.push({url: img.src, score: score, strategy: strat || 'playwright_svg_fallback'});
                     } else {
-                        // Reject tiny SVG icons (close buttons, arrows, etc.)
                         const vb = svg.getAttribute('viewBox');
                         if (vb) {
                             const parts = vb.trim().split(/[\s,]+/);
@@ -1700,11 +1997,20 @@ def _pw_extract_logo_from_page(page, domain):
                         const eh = parseFloat(svg.getAttribute('height') || '0');
                         if (ew > 0 && eh > 0 && ew < 20 && eh < 20) return;
                         let svgStr = svg.outerHTML;
-                        // Replace currentcolor with black so SVG renders standalone
-                        svgStr = svgStr.replace(/fill\s*=\s*["']currentcolor["']/gi, 'fill="#000000"');
-                        svgStr = svgStr.replace(/fill\s*:\s*currentcolor/gi, 'fill:#000000');
-                        svgStr = svgStr.replace(/stroke\s*=\s*["']currentcolor["']/gi, 'stroke="#000000"');
-                        svgStr = svgStr.replace(/stroke\s*:\s*currentcolor/gi, 'stroke:#000000');
+                        // Get the actual computed color (currentColor inherits from CSS 'color')
+                        const computedColor = window.getComputedStyle(svg).color || '#000000';
+                        let hexColor = '#000000';
+                        const rgbMatch = computedColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+                        if (rgbMatch) {
+                            const r = parseInt(rgbMatch[1]), g = parseInt(rgbMatch[2]), b = parseInt(rgbMatch[3]);
+                            hexColor = '#' + [r,g,b].map(c => c.toString(16).padStart(2,'0')).join('');
+                        } else if (computedColor.startsWith('#')) {
+                            hexColor = computedColor;
+                        }
+                        svgStr = svgStr.replace(/fill\s*=\s*["']currentcolor["']/gi, 'fill="' + hexColor + '"');
+                        svgStr = svgStr.replace(/fill\s*:\s*currentcolor/gi, 'fill:' + hexColor);
+                        svgStr = svgStr.replace(/stroke\s*=\s*["']currentcolor["']/gi, 'stroke="' + hexColor + '"');
+                        svgStr = svgStr.replace(/stroke\s*:\s*currentcolor/gi, 'stroke:' + hexColor);
                         if (svgStr.length > 200) {
                             const encoded = btoa(unescape(encodeURIComponent(svgStr)));
                             const dataUrl = 'data:image/svg+xml;base64,' + encoded;
@@ -1712,32 +2018,19 @@ def _pw_extract_logo_from_page(page, domain):
                         }
                     }
                 }
-                
-                if (parentHasLogo && (inHeader || inNav)) {
-                    serializeSvg(95, 'playwright_inline_svg');
-                    return;
-                }
-                
-                // Fallback: SVG inside <a> linking to homepage (even without logo class)
-                // Catches sites like Airbnb with atomic CSS (no semantic class names)
+                if (parentHasLogo && (inHeader || inNav)) { serializeSvg(95, 'playwright_inline_svg'); return; }
                 const link = svg.closest('a');
                 if (link) {
                     const href = (link.getAttribute('href') || '').trim();
-                    const ariaLabel = (link.getAttribute('aria-label') || '').toLowerCase();
                     const isHomepage = href === '/' || href === './' ||
                         href === location.origin || href === location.origin + '/' ||
                         (href.startsWith('http') && new URL(href, location.origin).pathname === '/');
                     if (isHomepage) {
-                        const rect = svg.getBoundingClientRect();
-                        if (inHeader || inNav || rect.top < 200) {
-                            serializeSvg(85, 'playwright_inline_svg');
-                            return;
-                        }
+                        if (inHeader || inNav) { serializeSvg(85, 'playwright_inline_svg'); return; }
                     }
                 }
             });
 
-            // Strategy 3: CSS background-image logos
             document.querySelectorAll('[class*="logo"], [class*="Logo"], [class*="brand"], [class*="Brand"]').forEach(el => {
                 const style = window.getComputedStyle(el);
                 const bg = style.backgroundImage || '';
@@ -1745,28 +2038,23 @@ def _pw_extract_logo_from_page(page, domain):
                 if (!match) return;
                 const bgUrl = match[1];
                 if (!bgUrl || bgUrl.startsWith('data:') || bgUrl.includes('gradient')) return;
-                // Must be an image file
                 if (!/\.(svg|png|jpg|jpeg|gif|webp)/i.test(bgUrl)) return;
                 const cls = getClassName(el).toLowerCase();
                 let score = 70;
                 if (cls.includes('logo')) score += 20;
                 if (cls.includes('brand')) score += 10;
-                // Check position
-                const rect = el.getBoundingClientRect();
-                if (rect.top < 200) score += 15;
                 let inHeader = false;
                 let parent = el;
                 while (parent) {
-                    if (parent.tagName === 'HEADER' || parent.tagName === 'NAV') { inHeader = true; break; }
-                    if (getClassName(parent).toLowerCase().includes('header')) { inHeader = true; break; }
+                    if (isSiteHeader(parent) || isSiteNav(parent)) { inHeader = true; break; }
                     parent = parent.parentElement;
                 }
-                if (inHeader) score += 10;
-                if (el.tagName === 'FOOTER' || getClassName(el).includes('footer')) score -= 40;
+                if (!inHeader) return;
+                score += 10;
+                if (el.tagName === 'FOOTER' || getClassName(el).includes('footer')) return;
                 results.push({url: bgUrl, score: score, strategy: 'playwright_css_bg'});
             });
 
-            // Strategy 4: JSON-LD in the rendered page
             document.querySelectorAll('script[type="application/ld+json"]').forEach(script => {
                 try {
                     const data = JSON.parse(script.textContent);
@@ -1776,7 +2064,6 @@ def _pw_extract_logo_from_page(page, domain):
                             const logoUrl = typeof item.logo === 'string' ? item.logo :
                                            (item.logo.url || item.logo.contentUrl || '');
                             if (logoUrl) {
-                                // Penalize dealer logos
                                 const lower = logoUrl.toLowerCase();
                                 const dealerHints = ['dealer-logo', 'dealer_logo', '/dealer/',
                                     'dealer-logos', 'dealer_logos', 'haendler', 'franchise'];
@@ -1789,7 +2076,6 @@ def _pw_extract_logo_from_page(page, domain):
                 } catch(e) {}
             });
 
-            // Sort by score
             results.sort((a, b) => b.score - a.score);
             return results.slice(0, 5);
         }""")
@@ -1800,60 +2086,55 @@ def _pw_extract_logo_from_page(page, domain):
         return None
 
     except Exception as e:
-        log.debug(f"Playwright error for {domain}: {e}")
+        log.debug(f"Async Playwright error for {domain}: {e}")
         return None
 
 
 def run_playwright_fallback(failed_domains, output_dir):
     """
     Process domains that failed static extraction using Playwright.
-    Sequential processing (Playwright sync API is not thread-safe).
+    Runs PW_CONCURRENCY tabs in parallel using async Playwright.
     """
     if not failed_domains:
         return {}
 
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.async_api import async_playwright
     except ImportError:
         log.warning("Playwright not installed - skipping dynamic fallback")
         return {}
 
     total = len(failed_domains)
-    log.info(f"Playwright fallback: processing {total} domains...")
+    log.info(f"Playwright fallback: processing {total} domains "
+             f"({PW_CONCURRENCY} parallel tabs)...")
+
+    # Shared mutable counters
+    counters = {"completed": 0, "found": 0}
     results = {}
+    lock = asyncio.Lock()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-            ],
-        )
-
-        completed = 0
-        found_count = 0
-
-        for domain in failed_domains:
+    async def _pw_process_one(browser, domain, semaphore):
+        """Process a single domain inside an async Playwright context."""
+        async with semaphore:
             start = time.monotonic()
             context = None
             page = None
             try:
-                context = browser.new_context(
+                context = await browser.new_context(
                     viewport={"width": 1280, "height": 720},
                     user_agent=USER_AGENTS[0],
                     ignore_https_errors=True,
                 )
-                context.set_default_timeout(15000)
-                context.route("**/*.{mp4,webm,ogg,mp3,wav,flac,aac}",
-                              lambda route: route.abort())
-                context.route("**/*.{woff,woff2,ttf,eot}",
-                              lambda route: route.abort())
+                context.set_default_timeout(12000)
+                await context.route("**/*.{mp4,webm,ogg,mp3,wav,flac,aac}",
+                                    lambda route: route.abort())
+                await context.route("**/*.{woff,woff2,ttf,eot}",
+                                    lambda route: route.abort())
 
-                page = context.new_page()
-                pw_result = _pw_extract_logo_from_page(page, domain)
+                page = await context.new_page()
+
+                # --- reuse sync extraction logic via evaluate ---
+                pw_result = await _pw_extract_logo_from_page_async(page, domain)
 
                 if pw_result and pw_result["logo_url"]:
                     result = LogoResult(
@@ -1870,77 +2151,110 @@ def run_playwright_fallback(failed_domains, output_dir):
                                 encoded = logo_url.split(",", 1)[1]
                                 svg_data = _sanitize_svg(b64.b64decode(encoded))
                                 if len(svg_data) > 100:
-                                    filepath = output_dir / (sanitize_filename(domain) + ".svg")
+                                    filepath = output_dir / (
+                                        sanitize_filename(domain) + ".svg")
                                     filepath.write_bytes(svg_data)
                                     result.downloaded_path = str(filepath)
                             except Exception:
                                 pass
                         else:
-                            import requests as req
-                            import urllib3
-                            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                            # Download via aiohttp in the event loop
                             try:
-                                resp = req.get(
-                                    logo_url,
-                                    timeout=10,
-                                    verify=False,
-                                    headers={"User-Agent": USER_AGENTS[0]},
-                                )
-                                if resp.status_code == 200 and len(resp.content) > MIN_IMAGE_SIZE:
-                                    ct = resp.headers.get("Content-Type", "").lower()
-                                    ext = ".png"
-                                    if "svg" in ct: ext = ".svg"
-                                    elif "jpeg" in ct or "jpg" in ct: ext = ".jpg"
-                                    elif "webp" in ct: ext = ".webp"
-                                    elif "gif" in ct: ext = ".gif"
-                                    elif "ico" in ct: ext = ".ico"
-
-                                    filepath = output_dir / (sanitize_filename(domain) + ext)
-                                    content_to_write = resp.content
-                                    if ext == ".svg" or "svg" in ct:
-                                        content_to_write = _sanitize_svg(content_to_write)
-                                    filepath.write_bytes(content_to_write)
-                                    result.downloaded_path = str(filepath)
+                                async with aiohttp.ClientSession() as dl_sess:
+                                    async with dl_sess.get(
+                                        logo_url,
+                                        timeout=aiohttp.ClientTimeout(total=10),
+                                        ssl=False,
+                                        headers={"User-Agent": USER_AGENTS[0]},
+                                    ) as resp:
+                                        if resp.status == 200:
+                                            data = await resp.read()
+                                            if len(data) > MIN_IMAGE_SIZE:
+                                                ct = resp.headers.get(
+                                                    "Content-Type", "").lower()
+                                                ext = ".png"
+                                                if "svg" in ct: ext = ".svg"
+                                                elif "jpeg" in ct or "jpg" in ct: ext = ".jpg"
+                                                elif "webp" in ct: ext = ".webp"
+                                                elif "gif" in ct: ext = ".gif"
+                                                elif "ico" in ct: ext = ".ico"
+                                                filepath = output_dir / (
+                                                    sanitize_filename(domain) + ext)
+                                                content_to_write = data
+                                                if ext == ".svg" or "svg" in ct:
+                                                    content_to_write = _sanitize_svg(
+                                                        content_to_write)
+                                                filepath.write_bytes(content_to_write)
+                                                result.downloaded_path = str(filepath)
                             except Exception:
                                 pass
 
                     result.extraction_time_ms = int(
-                        (time.monotonic() - start) * 1000
-                    )
-                    results[domain] = result
-                    found_count += 1
+                        (time.monotonic() - start) * 1000)
+                    async with lock:
+                        results[domain] = result
+                        counters["found"] += 1
+                        counters["completed"] += 1
+                        c = counters["completed"]
                     log.info(
-                        f"  PW [{completed+1}/{total}] ✓ {domain}: "
-                        f"{result.logo_url[:70]}"
-                    )
+                        f"  PW [{c}/{total}] ✓ {domain}: "
+                        f"{result.logo_url[:70]}")
                 else:
-                    log.info(
-                        f"  PW [{completed+1}/{total}] ✗ {domain}: no logo"
-                    )
+                    async with lock:
+                        counters["completed"] += 1
+                        c = counters["completed"]
+                    log.info(f"  PW [{c}/{total}] ✗ {domain}: no logo")
+
             except Exception as e:
                 log.debug(f"  PW error {domain}: {e}")
-                log.info(
-                    f"  PW [{completed+1}/{total}] ✗ {domain}: timeout/error"
-                )
+                async with lock:
+                    counters["completed"] += 1
+                    c = counters["completed"]
+                log.info(f"  PW [{c}/{total}] ✗ {domain}: timeout/error")
             finally:
                 try:
                     if page:
-                        page.close()
+                        await page.close()
                     if context:
-                        context.close()
+                        await context.close()
                 except Exception:
                     pass
 
-            completed += 1
-            if completed % 50 == 0:
-                log.info(
-                    f"  PW Progress: {completed}/{total} | "
-                    f"Found: {found_count} "
-                    f"({found_count*100//max(completed,1)}%)"
-                )
+    async def _pw_run_all():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                ],
+            )
+            semaphore = asyncio.Semaphore(PW_CONCURRENCY)
+            tasks = [
+                _pw_process_one(browser, domain, semaphore)
+                for domain in failed_domains
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await browser.close()
 
-        browser.close()
+    # Run the async Playwright loop
+    # We may already be inside an event loop (called from asyncio.run in main),
+    # so we create a *new* loop in a thread if needed.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
 
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(lambda: asyncio.run(_pw_run_all())).result()
+    else:
+        asyncio.run(_pw_run_all())
+
+    log.info(f"Playwright fallback done: {counters['found']}/{total} logos found")
     return results
 
 
@@ -2058,14 +2372,17 @@ def main():
                 f"Playwright fallback: {len(failed_domains)} failed + "
                 f"{len(weak_domains)} weak = {len(retry_domains)} domains to retry"
             )
-            pw_results = run_playwright_fallback(retry_domains, OUTPUT_DIR)
+            try:
+                pw_results = run_playwright_fallback(retry_domains, OUTPUT_DIR)
 
-            # Merge Playwright results back
-            for i, r in enumerate(results):
-                if r.domain in pw_results:
-                    pw_r = pw_results[r.domain]
-                    results[i] = pw_r
-                    log.info(f"  Updated {r.domain} via Playwright: {pw_r.logo_url}")
+                # Merge Playwright results back
+                for i, r in enumerate(results):
+                    if r.domain in pw_results:
+                        pw_r = pw_results[r.domain]
+                        results[i] = pw_r
+                        log.info(f"  Updated {r.domain} via Playwright: {pw_r.logo_url}")
+            except Exception as e:
+                log.error(f"Playwright fallback failed: {e}")
 
     elapsed = time.time() - start
     log.info(f"Extraction completed in {elapsed:.1f}s")

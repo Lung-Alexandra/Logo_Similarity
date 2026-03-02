@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="206" height="50" viewBox="0 0 206 30">
+    <!-- Logotype -->
+    <use xlink:href="/npfrontend/assets/icons.svg#logotype"></use>
+    <!-- Flag -->
+    <use xlink:href="/npfrontend/assets/icons.svg#flag-ng" x="176" y="-10"></use>
+</svg>

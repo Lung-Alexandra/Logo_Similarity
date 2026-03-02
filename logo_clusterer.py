@@ -51,7 +51,7 @@ for _i, _arg in enumerate(sys.argv):
         _K_CLUSTERS = int(sys.argv[_i + 1])
         break
 
-LOGO_DIR       = "extracted_logos"
+LOGO_DIR       = "extracted_logosp"
 RESULTS_FILE   = "extraction_results.json"
 OUTPUT_FILE    = "clustering_results.json"
 CLUSTER_DIR    = "clusters"

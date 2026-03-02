@@ -1,0 +1,11 @@
+aiohttp>=3.9
+beautifulsoup4>=4.12
+CairoSVG>=2.7
+ImageHash>=4.3
+lxml>=5.0
+numpy>=1.26
+pandas>=2.1
+pillow>=10.0
+playwright>=1.40
+playwright-stealth>=2.0
+pyarrow>=14.0

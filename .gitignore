@@ -1,7 +1,12 @@
 versions/*
 *.log
-*.txt
-extracted_logosv/*
-__pycache__/*
+*t.txt
+extracted_logospv
+extracted_logospvn
+extracted_logospvn2
+extracted_logos
+clusters
+__pycache__
 .venv
 .env
+v
